@@ -1,0 +1,648 @@
+---
+title: "P4: Trip Distribution"
+author: "Rubén Figueroa"
+format: html
+editor: visual
+---
+
+```{r, message=FALSE, warning=FALSE}
+options(java.parameters = '-Xmx4G')
+
+library(tidyverse)
+library(here)
+library(knitr)
+library(tigris)
+library(stringr)
+library(maptiles)
+library(tidyterra)
+library(r5r)
+library(sf)
+library(leaflet)
+
+here("code",
+     "grvty_balancing.R") |>
+  source()
+
+# Function for comparisons:
+plot_flows <- function(flow_df,
+                       obs_col_name,
+                       est_col_name) {
+  
+  summary <- flow_df |>
+    rename(obs = all_of(obs_col_name),
+           est = all_of(est_col_name)) |>
+    group_by(obs, est) |>
+    summarize(n = n()) 
+  
+  max_scale <- max(summary$obs, summary$est)
+  my_interval <- ceiling(max_scale / 10)
+  dot_size <- floor(70 / max_scale)
+  
+  max_n_exp = round(log10(max(summary$n)))
+  
+  ggplot(summary) +
+    geom_point(aes(x = obs,
+                   y = est,
+                   color = n),
+               size = dot_size) +
+    scale_x_continuous(name = "Observed flow", 
+                       limits = c(0, max_scale),
+                       breaks = seq(0, max_scale, by=my_interval)) +
+    scale_y_continuous(name = "Estimated flow", 
+                       limits = c(0, max_scale),
+                       breaks = seq(0, max_scale, by=my_interval)) +
+    scale_color_viridis_c(transform = "log",
+                          breaks = my_breaks <- c(10^seq(-1, 
+                                                         max_n_exp, 
+                                                         by=1)),
+                          labels = formatC(my_breaks, format = "d", 
+                                           big.mark = ","),
+                          direction = -1,
+                          name = "Number of P-A pairs") +
+    theme_minimal()
+}
+```
+
+I selected Bozeman, MT as my study area:
+
+```{r, message=FALSE, warning=FALSE}
+all_cbsas <- core_based_statistical_areas(progress_bar = FALSE,
+                                          year = 2024) |>
+  select(NAMELSAD)
+bozeman <- all_cbsas |>
+  filter(NAMELSAD == "Bozeman, MT Metro Area") |>
+  st_transform("WGS84")
+
+base_map <- get_tiles(bozeman,
+                      provider = "CartoDB.Positron",
+                      zoom = 9,
+                      crop = TRUE)
+
+ggplot(bozeman) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(fill = NA,
+          color = "darkorange") +
+  theme_void()
+```
+
+## Load Job Data
+
+```{r, message=FALSE, warning=FALSE}
+state <- "mt"
+year <- "2021"
+
+bozeman_counties_5_digit <- c("30031")
+bozeman_counties_3_digit <- substr(bozeman_counties_5_digit, 3, 5)
+
+url <- paste0("https://lehd.ces.census.gov/data/lodes/LODES8/",
+              state,
+              "/od/",
+              state,
+              "_od_main_JT00_",
+              year,
+              ".csv.gz")
+
+pa_data <- read_csv(url) |>
+  mutate(w_county = substr(w_geocode, 1, 5),
+         h_county = substr(h_geocode, 1, 5)) |>
+  filter(h_county %in% bozeman_counties_5_digit &
+           w_county %in% bozeman_counties_5_digit) |>
+  mutate(w_geocode = as.character(w_geocode),
+         h_geocode = as.character(h_geocode))
+```
+
+## Aggregate Zone Totals
+
+```{r, message=FALSE, warning=FALSE}
+total_prod <- pa_data |>
+  group_by(h_geocode) |>
+  summarise(goods_p = sum(SI01),
+            trade_p = sum(SI02),
+            serve_p = sum(SI03),
+            total_p = sum(S000)) |>
+  rename(geocode = h_geocode)
+
+total_attr <- pa_data |>
+  group_by(w_geocode) |>
+  summarize(goods_a = sum(SI01),
+            trade_a = sum(SI02),
+            serve_a = sum(SI03),
+            total_a = sum(S000)) |>
+  rename(geocode = w_geocode)
+
+trip_gen <- full_join(total_prod,
+                      total_attr) |>
+  replace_na(list(goods_p = 0, 
+                  goods_a = 0,
+                  trade_p = 0,
+                  trade_a = 0,
+                  serve_p = 0,
+                  serve_a = 0,
+                  total_p = 0,
+                  total_a = 0))
+```
+
+## Load Spatial Data
+
+```{r, message=FALSE, warning=FALSE}
+msa_blocks <- blocks(state = "MT",
+                     county = bozeman_counties_3_digit,
+                     progress_bar = FALSE)
+
+ggplot(msa_blocks) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(fill = NA,
+          color = "darkorange") +
+  theme_void()
+```
+
+Filter for blocks that have trip generation data:
+
+```{r, message=FALSE, warning=FALSE}
+trip_gen_locs <- msa_blocks |>
+  rename(geocode = GEOID20) |>
+  right_join(trip_gen) |>
+  select(geocode, 
+         goods_p, 
+         trade_p, 
+         serve_p,
+         total_p,
+         goods_a, 
+         trade_a,
+         serve_a,
+         total_a) |>
+  st_transform("WGS84")
+
+leaflet(trip_gen_locs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkorange",
+              fillColor = "darkorange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = trip_gen_locs$geocode)
+```
+
+## Load the Network
+
+```{r, message=FALSE, warning=FALSE}
+bozeman_core <- here("network") |>
+  setup_r5()
+
+street_vis <- street_network_to_sf(bozeman_core)
+
+street_lines <- street_vis$edges
+street_pts <- street_vis$vertices
+
+base_map <- get_tiles(street_lines,
+                      provider = "CartoDB.Positron",
+                      zoom = 8,
+                      crop = TRUE)
+
+ggplot() +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(data = trip_gen_locs,
+          color = "palegreen3",
+          fill = "palegreen") +
+  geom_sf(data = street_lines,
+          color =  "salmon") +
+  theme_void()
+```
+
+## Skim the Network
+
+```{r, eval = FALSE}
+trip_gen_loc_ids <- trip_gen_locs |>
+  st_point_on_surface() |>
+  st_nearest_feature(street_pts)
+
+trip_gen_pts <- street_pts[trip_gen_loc_ids,] |>
+  mutate(id = trip_gen_locs$geocode) |>
+  select(id)
+
+bozeman_core <- here("network") |>
+  setup_r5()
+
+skim <- travel_time_matrix(bozeman_core,
+                           origins = trip_gen_pts,
+                           destinations = trip_gen_pts,
+                           mode = "CAR",
+                           max_trip_duration = 240)
+
+
+stop_r5()
+
+write_csv(skim, file = here("bozeman-skim1.csv"))
+```
+
+Load the skim:
+
+```{r, message=FALSE, warning=FALSE}
+skim <- read_csv(here("bozeman-skim1.csv"),
+                 col_types = "ccn")
+
+nrow(skim)
+```
+
+Identify those blocks without trips:
+
+```{r, message=FALSE, warning=FALSE}
+blocks_with_trips <- unique(skim$from_id)
+
+trip_gen_locs <- trip_gen_locs |>
+  mutate(trips = ifelse(geocode %in% blocks_with_trips, "trips", "no trips"))
+
+pal <- colorFactor(palette = "YlOrRd", domain = trip_gen_locs$trips)
+
+leaflet(trip_gen_locs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = ~pal(trips),
+              fillColor = ~pal(trips),
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = trip_gen_locs$trips)
+```
+
+Identify the potential causes for no trips:
+
+```{r, message=FALSE, warning=FALSE}
+blocks_wo_trips <- trip_gen |>
+  filter(!(geocode %in% blocks_with_trips)) |>
+  select(geocode)
+blocks_wo_trips <- as.vector(blocks_wo_trips$geocode)
+
+trip_gen_eg <- trip_gen_locs |>
+  filter(geocode == blocks_wo_trips[22])
+
+trip_gen_loc_ids <- trip_gen_locs |>
+  st_point_on_surface() |>
+  st_nearest_feature(street_pts)
+
+trip_gen_pts <- street_pts[trip_gen_loc_ids,] |>
+  mutate(id = trip_gen_locs$geocode) |>
+  select(id)
+
+trip_pts_eg <- trip_gen_pts |>
+  filter(id == blocks_wo_trips[22])
+
+trip_buffer <- st_buffer(trip_gen_eg, dist = 1000)
+nearby_lines <- street_lines[st_intersects(street_lines, trip_buffer, sparse = FALSE), ]
+
+leaflet(trip_gen_eg) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkorange",
+              fillColor = "darkorange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = trip_gen_eg$geocode) |>
+  addCircleMarkers(data = trip_pts_eg,  
+                   weight = 2,
+                   color = "transparent", 
+                   fillColor = "green",
+                   radius = 6,
+                   fillOpacity = 0.6,
+                   label = trip_pts_eg$id) |>
+  addPolylines(data = nearby_lines,
+               weight = 1,
+               color = "salmon",
+               opacity = 0.7)
+```
+
+We will assume that all blocks suffer from the same condition and will eliminate them from our working sample:
+
+```{r, message=FALSE, warning=FALSE}
+pa_data <- pa_data |>
+  filter(!(h_geocode %in% blocks_wo_trips)) |>
+  filter(!(w_geocode %in% blocks_wo_trips))
+
+total_prod <- pa_data |>
+  group_by(h_geocode) |>
+  summarise(goods_p = sum(SI01),
+            trade_p = sum(SI02),
+            serve_p = sum(SI03),
+            total_p = sum(S000)) |>
+  rename(geocode = h_geocode)
+
+total_attr <- pa_data |>
+  group_by(w_geocode) |>
+  summarize(goods_a = sum(SI01),
+            trade_a = sum(SI02),
+            serve_a = sum(SI03),
+            total_a = sum(S000)) |>
+  rename(geocode = w_geocode)
+
+trip_gen <- full_join(total_prod,
+                      total_attr) |>
+  replace_na(list(goods_p = 0, 
+                  goods_a = 0,
+                  trade_p = 0,
+                  trade_a = 0,
+                  serve_p = 0,
+                  serve_a = 0,
+                  total_p = 0,
+                  total_a = 0))
+
+trip_gen_locs <- msa_blocks |>
+  rename(geocode = GEOID20) |>
+  right_join(trip_gen) |>
+  select(geocode, 
+         goods_p, 
+         trade_p, 
+         serve_p,
+         total_p,
+         goods_a, 
+         trade_a,
+         serve_a,
+         total_a) |>
+  st_transform("WGS84")
+
+leaflet(trip_gen_locs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "darkorange",
+              fillColor = "darkorange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = trip_gen_locs$geocode)
+```
+
+After eliminating these blocks' attractions, workers and their homes, we are left with 3,199 blocks. We will now calculate our new travel time matrix:
+
+```{r, eval = FALSE}
+trip_gen_loc_ids <- trip_gen_locs |>
+  st_point_on_surface() |>
+  st_nearest_feature(street_pts)
+
+trip_gen_pts <- street_pts[trip_gen_loc_ids,] |>
+  mutate(id = trip_gen_locs$geocode) |>
+  select(id)
+
+bozeman_core <- here("network") |>
+  setup_r5()
+
+skim <- travel_time_matrix(bozeman_core,
+                           origins = trip_gen_pts,
+                           destinations = trip_gen_pts,
+                           mode = "CAR",
+                           max_trip_duration = 240)
+
+stop_r5()
+
+write_csv(skim, file = here("bozeman-skim.csv"))
+```
+
+Load the skim:
+
+```{r, message=FALSE, warning=FALSE}
+skim <- read_csv(here("bozeman-skim.csv"),
+                 col_types = "ccn")
+
+nrow(skim)
+```
+
+Now we get the desired result: 10,233,601 = 3,199\^2.
+
+## Gravity Model
+
+I will apply gravity models only for the **goods** and **services** sector. First, let's try the model with beta = 1/average time:
+
+```{r, message = FALSE}
+flow_tt <- pa_data |>
+  rename(from_id = h_geocode,
+         to_id = w_geocode) |>
+  right_join(skim) |>
+  rename(flow_goods = SI01,
+         flow_serve = SI03) |>
+  replace_na(list(flow_goods = 0,
+                  flow_serve = 0))
+
+avg_tts <- tibble(`Worker sector` = c("Goods","Services"),
+                  `Average travel time (observed)` = c(
+                    sum(flow_tt$flow_goods * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_goods),
+                    sum(flow_tt$flow_serve * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_serve)))
+
+betas <- 1/avg_tts$`Average travel time (observed)`
+names(betas) <- c("Goods","Services")
+
+initial_betas <- tibble(`Worker sector` = names(betas),
+                  `Initial β value` = betas)
+
+friction <- tibble(`Travel time (min)` = seq(0, 30, by=1)) |>
+  mutate(Goods = exp(-1 * betas["Goods"] * `Travel time (min)`),
+         Services = exp(-1 * betas["Services"] * `Travel time (min)`)) |>
+  pivot_longer(cols = -`Travel time (min)`,
+               names_to = "Industry") |>
+  rename(`Destination attractiveness` = value)
+
+ggplot(friction) +
+  geom_line(aes(x = `Travel time (min)`,
+                y = `Destination attractiveness`,
+                linetype = Industry)) +
+  scale_x_continuous(breaks = seq(0, 30, by=5)) +
+  scale_y_continuous(breaks = seq(0, 1.1, by=0.1)) +
+  theme_minimal()
+```
+
+Now, we will calculate friction factors and estimate an initial trip matrix:
+
+```{r, eval = FALSE}
+flow_tt <- flow_tt |>
+  mutate(friction_goods = exp(-1 * betas["Goods"] * travel_time_p50),
+         friction_serve = exp(-1 * betas["Services"] * travel_time_p50))
+
+flow_goods_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "goods_p",
+                                  zone_d = "goods_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_goods",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+flow_serve_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "serve_p",
+                                  zone_d = "serve_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_serve",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+write_csv(flow_goods_est$flows,
+          file = here("init-goods-flow.csv"))
+
+write_csv(flow_serve_est$flows,
+          file = here("init-serve-flow.csv"))
+```
+
+Let's look at this model's fit:
+
+```{r, message = false}
+flow_goods <- here("init-goods-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         goods_flow_est = flow)
+
+flow_serve <- here("init-serve-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         serve_flow_est = flow)
+
+flow_tt <- flow_tt |>
+  left_join(flow_goods) |>
+  left_join(flow_serve)
+
+avg_tts <- avg_tts |>
+  mutate(`Average travel time (estimated)` = c(
+    sum(flow_tt$goods_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$goods_flow_est),
+    sum(flow_tt$serve_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$serve_flow_est)))
+
+avg_tts <- avg_tts |>
+  mutate(rmse = c((mean((flow_tt$flow_goods - flow_tt$goods_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_serve - flow_tt$serve_flow_est)^2))^0.5))
+
+kable(avg_tts, digits = 2)
+
+plot_flows(flow_tt, 
+           obs_col_name = "flow_goods",
+           est_col_name = "goods_flow_est")
+
+plot_flows(flow_tt, 
+           obs_col_name = "flow_serve",
+           est_col_name = "serve_flow_est")
+```
+
+Now let's look at a calibrated model:
+
+```{r, eval = FALSE}
+flow_tt <- flow_tt |>
+  select(-goods_flow_est,
+         -serve_flow_est)
+
+## Calibrate goods beta
+calibrated_flows_goods <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_goods",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_goods <- calibrated_flows_goods$beta
+
+goods_flow_est <- calibrated_flows_goods$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         goods_flow_est = flow_est) |>
+  select(from_id, to_id, goods_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(goods_flow_est)
+
+## calibrate service beta
+calibrated_flows_serve <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_serve",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_serve <- calibrated_flows_serve$beta
+
+serve_flow_est <- calibrated_flows_serve$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         serve_flow_est = flow_est) |>
+  select(from_id, to_id, serve_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(serve_flow_est)
+
+## betas table:
+betas_table <- tibble(Industry = c("Goods",
+                                   "Service"),
+                      beta_initial = betas,
+                      beta_calibrated = c(beta_goods,
+                                          beta_serve))
+write_csv(flow_tt,
+          here("calib-flows.csv"))
+
+write_csv(betas_table,
+          here("calib-betas.csv"))
+```
+
+Let's look at this model's fit:
+
+```{r, message = FALSE}
+flow_tt <- here("calib-flows.csv") |>
+  read_csv()
+
+avg_tts <- avg_tts |>
+  select(-rmse) |>
+  mutate(`Average travel time (estimated)` = c(
+    sum(flow_tt$goods_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$goods_flow_est),
+    sum(flow_tt$serve_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$serve_flow_est)))
+
+avg_tts <- avg_tts |>
+  mutate(rmse = c((mean((flow_tt$flow_goods - flow_tt$goods_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_serve - flow_tt$serve_flow_est)^2))^0.5))
+
+kable(avg_tts, digits = 2)
+
+plot_flows(flow_tt,
+           obs_col_name = "flow_goods",
+           est_col_name = "goods_flow_est")
+
+plot_flows(flow_tt,
+           obs_col_name = "flow_serve",
+           est_col_name = "serve_flow_est")
+```
+
+Finally, let's analyze the calibrated betas:
+
+```{r, message = FALSE}
+betas_table <- here("calib-betas.csv") |> 
+  read_csv()
+
+friction <- tibble(`Travel time (min)` = seq(1, 60, by=1)) |>
+  mutate(Goods = exp(-1 * betas_table$beta_calibrated[1] * `Travel time (min)`),
+         Services = exp(-1 * betas_table$beta_calibrated[2] * `Travel time (min)`)) |>
+  pivot_longer(cols = -`Travel time (min)`,
+               names_to = "Sector") |>
+  rename(`Destination attractiveness` = value) |>
+  filter(`Destination attractiveness` < 2)
+
+ggplot(friction) +
+  geom_line(aes(x = `Travel time (min)`,
+                y = `Destination attractiveness`,
+                linetype = Sector)) +
+  scale_x_continuous(breaks = seq(0, 60, by=5)) +
+  scale_y_continuous(breaks = seq(0, 2, by=0.1),
+                     limits = c(0, 2)) +
+  theme_minimal()
+```
+
+End of project.
